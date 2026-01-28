@@ -1,0 +1,17 @@
+<launch>
+  <!-- Load the URDF file into the parameter server -->
+  <param name="robot_description" command="$(find dobot_cr10.urdf.xacro)/xacro --inorder $(find dobot_cr10_description)/urdf/dobot_cr10.urdf.xacro" />
+
+  <!-- Launch robot_state_publisher to publish TF transforms -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+
+  <!-- (Optional) Launch joint_state_publisher or GUI for control -->
+  <node name="joint_state_publisher_gui" pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" />
+
+  <!-- (Optional) Launch Gazebo with your robot -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="use_sim_time" value="true"/>
+  </include>
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model" args="-param robot_description -urdf -model my_robot_name" />
+
+</launch>
