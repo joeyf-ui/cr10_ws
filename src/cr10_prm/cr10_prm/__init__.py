@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+import random
+import time
+import pybullet as p
+import pybullet_data
+import numpy as np
+from ompl import base as ob
+from ompl import geometric as og
+
+# ===============================
+# Bullet Collision Checker
+# ===============================
+class BulletCollisionChecker:
+    def __init__(self, robot_id, joint_indices, joint_limits, obstacle_ids=None):
+        self.robot_id = robot_id
+        self.joint_indices = joint_indices
+        self.joint_limits = joint_limits
+        self.ndof = len(joint_indices)
+        self.obstacle_ids = obstacle_ids if obstacle_ids else []
+
+        # Build set of adjacent links (parent-child pairs)
+        self.adjacent_links = set()
+        for i in range(p.getNumJoints(robot_id)):
+            info = p.getJointInfo(robot_id, i)
+            parent = info[16]  # parent link index
+            child = i          # child link index
+            if parent >= 0:
+                self.adjacent_links.add((parent, child))
+                self.adjacent_links.add((child, parent))  # undirected
+
+    def set_state(self, q):
+        for j, v in zip(self.joint_indices, q):
+            p.resetJointState(self.robot_id, j, v)
+
+    def in_collision(self, q):
+        self.set_state(q)
+        p.performCollisionDetection()
+
+        # Self-collision: only allow contacts between adjacent links
+        contacts = p.getContactPoints(self.robot_id, self.robot_id)
+        for c in contacts:
+            link_a = c[3]
+            link_b = c[4]
+            if (link_a, link_b) in self.adjacent_links:
+                continue  # allowed
+            return True  # collision detected
+
+        # Collision with obstacles (table)
+        for obs_id in self.obstacle_ids:
+            if len(p.getContactPoints(self.robot_id, obs_id)) > 0:
+                return True
+
+        return False
+
+    def sample_valid_state(self, max_tries=3000):
+        for _ in range(max_tries):
+            q = [random.uniform(lo, hi) for lo, hi in self.joint_limits]
+            if not self.in_collision(q):
+                return q
+        raise RuntimeError("Failed to sample collision-free state")
+
+    def sample_nearby_state(self, q_center, radius=6.0, max_tries=1000):
+        # 10% chance: global random jump for better exploration
+        if random.random() < 0.1:
+            return self.sample_valid_state()
+
+        for _ in range(max_tries):
+            q = [random.uniform(max(lo, qc - radius), min(hi, qc + radius))
+                 for qc, (lo, hi) in zip(q_center, self.joint_limits)]
+            if not self.in_collision(q):
+                return q
+        return self.sample_valid_state()
+
+# ===============================
+# PRM Planner
+# ===============================
+def plan_prm(collision_checker, start_q, planning_time=0.1):
+    dim = collision_checker.ndof
+    space = ob.RealVectorStateSpace(dim)
+    bounds = ob.RealVectorBounds(dim)
+    for i, (lo, hi) in enumerate(collision_checker.joint_limits):
+        bounds.setLow(i, lo)
+        bounds.setHigh(i, hi)
+    space.setBounds(bounds)
+
+    si = ob.SpaceInformation(space)
+
+    def is_valid(state):
+        q = [state[i] for i in range(dim)]
+        return not collision_checker.in_collision(q)
+
+    si.setStateValidityChecker(ob.StateValidityCheckerFn(is_valid))
+    si.setup()
+
+    goal_q = collision_checker.sample_nearby_state(start_q)
+
+    start = ob.State(space)
+    goal = ob.State(space)
+    for i in range(dim):
+        start[i] = start_q[i]
+        goal[i] = goal_q[i]
+
+    pdef = ob.ProblemDefinition(si)
+    pdef.setStartAndGoalStates(start, goal)
+
+    planner = og.PRMstar(si)
+    planner.setProblemDefinition(pdef)
+    planner.setup()
+
+    solved = planner.solve(planning_time)
+    if not solved:
+        return None, None
+
+    path = pdef.getSolutionPath()
+    path.interpolate()
+
+    joint_path = []
+    for i in range(path.getStateCount()):
+        joint_path.append([path.getState(i)[j] for j in range(dim)])
+
+    return joint_path, goal_q
+
+# ===============================
+# Interpolate path for smooth animation
+# ===============================
+def interpolate_path(path, max_steps_per_edge=5):
+    smooth = []
+    for i in range(len(path) - 1):
+        q0 = np.array(path[i])
+        q1 = np.array(path[i + 1])
+        steps = max(1, min(max_steps_per_edge, int(np.linalg.norm(q1 - q0)/0.1)))
+        for s in range(steps):
+            alpha = s / steps
+            smooth.append((1 - alpha) * q0 + alpha * q1)
+    smooth.append(path[-1])
+    return smooth
+
+# ===============================
+# Animate robot along joint-space path
+# ===============================
+def animate_path_fk(robot_id, joint_indices, path, dt=0.05):
+    for q in path:
+        for j, v in zip(joint_indices, q):
+            p.resetJointState(robot_id, j, v)
+        p.stepSimulation()
+        time.sleep(dt)
+
+# ===============================
+# Main
+# ===============================
+def main():
+    urdf_path = "/home/joey/cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10_boxes.urdf"
+
+    # ---- GUI ----
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation()
+    p.setGravity(0, 0, -9.81)
+
+    # ---- Load table ----
+    table_id = p.loadURDF(
+        "table/table.urdf",
+        basePosition=[0, 0, 0],
+        useFixedBase=True
+    )
+
+    # ---- Load robot on table ----
+    robot_base_height = 0.63
+    robot_id = p.loadURDF(
+        urdf_path,
+        basePosition=[0, 0, robot_base_height],
+        useFixedBase=True,
+        flags=p.URDF_USE_SELF_COLLISION
+    )
+
+    # ---- Joints ----
+    joint_indices = []
+    joint_limits = []
+    for i in range(p.getNumJoints(robot_id)):
+        info = p.getJointInfo(robot_id, i)
+        if info[2] == p.JOINT_REVOLUTE:
+            lo, hi = info[8], info[9]
+            if lo >= hi:
+                lo, hi = -np.pi, np.pi
+            joint_indices.append(i)
+            joint_limits.append((lo, hi))
+
+    collision_checker = BulletCollisionChecker(
+        robot_id, joint_indices, joint_limits, obstacle_ids=[table_id]
+    )
+
+    # ---- Initial configuration ----
+    current_q = collision_checker.sample_valid_state()
+    trials = 0
+    failures = 0
+    points = []
+
+    # ---- Loop ----
+    while True:
+        points.append(current_q)
+        joint_path, goal_q = plan_prm(collision_checker, current_q)
+        if joint_path is None:
+            print("No path found, replanning...")
+            failures = failures + 1
+            time.sleep(0.5)
+            continue
+
+        smooth_path = interpolate_path(joint_path, max_steps_per_edge=5)
+        animate_path_fk(robot_id, joint_indices, smooth_path, dt=0.05)
+        time.sleep(1.0)
+        trials = trials + 1
+        current_q = goal_q
+        if trials == 100:
+            
+            print("Finished 100 trials with", failures, "failures.")
+            print(points)
+            break
+            
+
+
+if __name__ == "__main__":
+    main()
