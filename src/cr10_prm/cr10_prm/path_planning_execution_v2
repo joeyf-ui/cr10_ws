@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+from importlib.resources import path
+import random
+import time
+import math
+import threading
+import pybullet as p
+import pybullet_data
+import numpy as np
+from ompl import base as ob
+from ompl import geometric as og
+import cv2
+import threading
+import pyzed.sl as sl
+from scipy.spatial.transform import Rotation as Rot
+from ultralytics import YOLO
+from dobot_api import DobotApi, DobotApiMove, DobotApiDashboard, MyType
+from time import sleep
+from ikpy.chain import Chain
+from ikpy.inverse_kinematics import inverse_kinematic_optimization
+
+# ===============================
+# Bullet Collision Checker
+# ===============================
+class BulletCollisionChecker:
+    def __init__(self, robot_id,robot_id_collision, joint_indices, joint_limits, obstacle_ids=None):
+        self.robot_id = robot_id
+        self.robot_id_collision = robot_id_collision
+        self.joint_indices = joint_indices
+        self.joint_limits = joint_limits 
+        self.ndof = len(joint_indices)
+        self.obstacle_ids = obstacle_ids if obstacle_ids else []
+
+        # Build set of adjacent links (parent-child pairs)
+        self.adjacent_links = set()
+        for i in range(p.getNumJoints(self.robot_id_collision)):
+            info = p.getJointInfo(self.robot_id_collision, i)
+            parent = info[16]  # parent link index
+            child = i          # child link index
+            if parent >= 0:
+                self.adjacent_links.add((parent, child))
+                self.adjacent_links.add((child, parent))  # undirected
+
+    def set_state(self, q):
+        for j, v in zip(self.joint_indices, q):
+            p.resetJointState(self.robot_id, j, v)
+
+    def in_collision(self, q):
+        self.set_state(q)
+        p.performCollisionDetection()
+
+        # Self-collision: only allow contacts between adjacent links
+        contacts = p.getContactPoints(self.robot_id_collision, self.robot_id_collision)
+        for c in contacts:
+            link_a = c[3]
+            link_b = c[4]
+            if abs(link_a - link_b) <= 1:
+                continue  # allowed
+            return True  # collision detected
+
+        # Collision with obstacles (table)
+        for obs_id in self.obstacle_ids:
+            if len(p.getContactPoints(self.robot_id_collision, obs_id)) > 0:
+                return True
+
+        return False
+    
+def orientation(robot_id, ee_link = 5, tol_degree=0.5):
+    pos, orn = p.getLinkState(robot_id, ee_link)[:,2]
+    R = np.array(p.getMatrixFromQuaternion(orn)).reshape(3,3)
+
+    z_axis = R[:,2]
+
+    angle = np.degrees(np.arccos(np.clip(np.dot(z_axis, [0,0,1]), -1.0, 1.0)))
+    return angle < tol_degree
+
+def plan_prm(collision_checker, start_q, joints, planning_time=1.0):
+    dim = collision_checker.ndof
+    print("dim:", dim)
+    space = ob.RealVectorStateSpace(dim)
+    bounds = ob.RealVectorBounds(dim)
+    for i, (lo, hi) in enumerate(collision_checker.joint_limits):
+        bounds.setLow(i, lo)
+        bounds.setHigh(i, hi)
+    space.setBounds(bounds)
+    si = ob.SpaceInformation(space)
+    def is_valid(state):
+        q = [state[i] for i in range(dim)]
+        if collision_checker.in_collision(q):
+            return False
+        return True
+
+    si.setStateValidityChecker(ob.StateValidityCheckerFn(is_valid))
+    si.setup()
+    goal_q = joints
+    valid = 0
+    for _ in range(100):
+        q = [np.random.uniform(lo,hi) for (lo,hi) in collision_checker.joint_limits]
+        if not collision_checker.in_collision(q):
+            valid += 1
+    print(f"Found {valid} valid random configurations out of 100")
+
+    start = ob.State(space)
+    goal = ob.State(space)
+    for i in range(dim):
+        start[i] = start_q[i]
+        goal[i] = goal_q[i]
+
+    objective = ob.PathLengthOptimizationObjective(si)
+
+
+    pdef = ob.ProblemDefinition(si)
+    pdef.setStartAndGoalStates(start, goal)
+    pdef.setOptimizationObjective(objective)
+
+    planner = og.PRMstar(si)
+    planner.setProblemDefinition(pdef)
+    planner.setup()
+
+    solved = planner.solve(planning_time)
+    if not solved:
+        print("No solution found")
+        return None
+    
+    if solved:
+        print("Found solution:")
+
+        path = pdef.getSolutionPath()
+        print("path:" , path)
+        joint_path = []
+        for i in range(path.getStateCount()):
+            joint_path.append([path.getState(i)[j] for j in range(dim)])
+        print("Joint path:", joint_path)
+
+    return joint_path
+        
+
+# ===============================
+# Interpolate path for smooth animation
+# ===============================
+def interpolate_path(path, max_steps_per_edge=5):
+    smooth = []
+    for i in range(len(path) - 1):
+        q0 = np.array(path[i])
+        q1 = np.array(path[i + 1])
+        steps = max(1, min(max_steps_per_edge, int(np.linalg.norm(q1 - q0)/0.1)))
+        for s in range(steps):
+            alpha = s / steps
+            smooth.append((1 - alpha) * q0 + alpha * q1)
+    smooth.append(path[-1])
+    return smooth
+
+# ===============================
+# Animate robot along joint-space path
+# ===============================
+def animate_path_fk(robot_id, joint_indices, path, dt=0.05):
+    for q in path:
+        for j, v in zip(joint_indices, q):
+            p.resetJointState(robot_id, j, v)
+        p.stepSimulation()
+        time.sleep(dt)
+
+
+INIT_SCANNING_POS = -90
+SCANNING_TRAVEL = 0
+SCAN_DELAY = 2
+CONF_VALUE = 0.5
+INCH_TO_MM = 25.4
+
+class ZEDYOLO3D:
+    def __init__(self, robot_id, collision_checker, chain, robot_ip="192.168.5.1", yolo_model='/home/user/cr10_ws/watermelon_detection/weights/small_v2.pt'):
+        # Initialize ZED camera
+        self.zed = sl.Camera()
+
+        # Configure ZED camera parameters
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.HD1080
+        init_params.camera_fps = 15
+        init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+        init_params.coordinate_units = sl.UNIT.MILLIMETER
+
+        # Open the camera
+        if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+            print("Failed to open ZED camera")
+            exit(1)
+
+        # Initialize runtime parameters
+        self.runtime_parameters = sl.RuntimeParameters()
+
+        # Initialize YOLO model
+        self.model = YOLO(yolo_model)
+
+        # Camera information
+        self.camera_info = self.zed.get_camera_information()
+        self.resolution = self.camera_info.camera_configuration.resolution
+
+        # Create matrices for image and depth
+        self.image_left = sl.Mat(self.resolution.width, self.resolution.height)
+        self.depth_map = sl.Mat(self.resolution.width, self.resolution.height)
+        self.point_cloud = sl.Mat(self.resolution.width, self.resolution.height)
+        self.model.to('cpu')
+        print("GPU: ", self.model.device)
+
+        # Initialize arm
+        self.robot_ip = robot_ip
+        self.dashboard = None
+        self.move = None
+        self.feed = None
+        self.connected = False
+        self.close = None
+        self.previous_com = ''
+
+        # Real-time data
+        self.current_position = None
+        self.joint_angles = None
+        self.feed_thread = None
+        
+        # Thread control
+        self.auto_scan_thread = None
+        self.stop_auto_scan = threading.Event()
+        self.video_thread = None
+        self.stop_video = threading.Event()
+        self.auto_scan_active = False
+
+        # Collision Detection
+        self.robot_id = robot_id
+        self.collision_checker = collision_checker
+        self.chain = chain
+
+
+        self.j1_harvest = 0
+
+        self.connect_robot()
+
+    def get_surface_normal_from_zed(self, x, y):
+        """Get surface normal directly from ZED normal map"""
+        try:
+            # Retrieve normal map from ZED
+            normal_map = sl.Mat()
+            self.zed.retrieve_measure(normal_map, sl.MEASURE.NORMALS)
+
+            # Get normal at the detected pixel coordinates
+            err, normal = normal_map.get_value(x, y)
+
+            if err == sl.ERROR_CODE.SUCCESS and np.isfinite(normal[:3]).all():
+                # Normal is [nx, ny, nz, 0] - use first 3 components
+                normal_vector = np.array([normal[0], normal[1], normal[2]])
+
+                # Normalize just to be safe
+                normal_length = np.linalg.norm(normal_vector)
+                if normal_length > 0:
+                    normal_vector = normal_vector / normal_length
+
+                return normal_vector
+            else:
+                return None
+
+        except Exception as e:
+            print(f"ZED normal map error: {e}")
+            return None
+
+    def normal_to_euler_angles(self, normal_vector):
+        """Convert surface normal vector to Euler angles (Rx, Ry, Rz) for robot"""
+        try:
+            # Desired Z-axis is the surface normal (suction cup perpendicular to surface)
+            desired_z = normal_vector / np.linalg.norm(normal_vector)
+
+            # Choose a reference direction for X-axis (could be robot's current X direction)
+            # For simplicity, use global X-axis as reference, but project it to be perpendicular to normal
+            reference_x = np.array([1, 0, 0])
+
+            # If normal is parallel to reference, use different reference
+            if np.abs(np.dot(desired_z, reference_x)) > 0.9:
+                reference_x = np.array([0, 1, 0])
+
+            # Calculate Y-axis (perpendicular to Z and X)
+            desired_y = np.cross(desired_z, reference_x)
+            desired_y = desired_y / np.linalg.norm(desired_y)
+
+            # Recalculate X-axis to ensure orthogonality
+            desired_x = np.cross(desired_y, desired_z)
+            desired_x = desired_x / np.linalg.norm(desired_x)
+
+            # Create rotation matrix
+            rotation_matrix = np.column_stack([desired_x, desired_y, desired_z])
+
+            # Convert to Euler angles (ZYX convention - common for robots)
+            # Note: Dobot might use different convention - check your robot documentation
+            rotation = Rot.from_matrix(rotation_matrix)
+            euler_angles = rotation.as_euler('zyx', degrees=True)  # Z, Y, X order
+            # for row : rotation_matrix:
+
+            #print(rotation_matrix.shape)
+
+            # Convert to Rx, Ry, Rz (Dobot convention - typically in degrees)
+            # Dobot usually uses Rx, Ry, Rz in degrees
+
+            rx = euler_angles[2]  # X rotation
+            ry = euler_angles[1]  # Y rotation
+            rz = euler_angles[0]  # Z rotation
+
+            print("Rotation matrix of endeffector relative to base")
+            print("Rx:", rx, "Ry:", ry, "Rz:", rz)
+
+            return rx, ry, rz
+
+        except Exception as e:
+            print(f"Euler angle conversion error: {e}")
+            return 180, 0, 0  # Fallback to horizontal orientation
+    
+
+    def inverse_kinematics(self, robot_pos, rot):
+        #Get watermelon position in joint space
+        pos = [robot_pos[0], robot_pos[1], robot_pos[2]]
+        orn = p.getQuaternionFromEuler([np.radians(rot[0]), np.radians(rot[1]), np.radians(rot[2])])
+        current = np.radians(self.get_joint())
+        print("Current joint angles (radians):", current)
+        rot_mat = [[np.radians(rot[0]), 0 ,0], [0, np.radians(rot[1]), 0], [0, 0, np.radians(rot[2])]]
+        #sol = inverse_kinematic_optimization(self.chain, target_frame=pos, starting_nodes_angles=current, max_iter=20, orientation_mode="Z")
+        #print("IK solution:", sol)
+
+        joints = p.calculateInverseKinematics(self.robot_id,5,pos, orn, restPoses=current)
+        print("Calculated joint angles (radians):", joints)
+        return joints
+    
+    def enhanced_pickup_watermelon(self, watermelon_object):
+        """Enhanced pickup with surface normal alignment and PRM path planning"""
+        if not self.connected:
+            print("Robot not connected")
+            return False
+
+        try:
+            # Get watermelon center 
+            bbox = watermelon_object['bbox']
+            center_x = int((bbox[0] + bbox[2]) / 2)
+            center_y = int((bbox[1] + bbox[3]) / 2)
+
+            # Get surface normal at detected point
+            surface_normal = self.get_surface_normal_from_zed(center_x, center_y)
+            if surface_normal is not None:
+                rx, ry, rz = self.normal_to_euler_angles(surface_normal)
+                print(f"Surface normal alignment -", "Rx:", rx, "Ry:", ry, "Rz:", rz)
+            else:
+                rx, ry, rz = 180, 0, 0  # fallback horizontal
+                print("Using horizontal approach (fallback)")
+
+            # Transform 3D position from camera to robot base
+            watermelon_pos = watermelon_object['position_3d']
+            robot_pos = self.transform_camera_to_robot(watermelon_pos)
+            print("Transformed robot coordinates:", robot_pos)
+            suction_pos = self.apply_suction_offset(robot_pos, rx, ry, rz)
+            if robot_pos is None:
+                print("Failed to transform coordinates")
+                return False
+
+            # Pickup positions
+            current_height = self.get_current_pose()[2]  
+            pickup_height = 0 # mm from surface
+
+            # Approach position (above watermelon)
+            approach_pos = self.get_current_pose().copy()  # Start from current position
+            approach_pos[0] = suction_pos[0]
+            approach_pos[1] = suction_pos[1]  # Update Y to be directly above watermelon after reaching approach height
+
+            # Pickup position (close to surface)
+            pickup_pos = suction_pos.copy()
+            pickup_pos[2] += pickup_height
+
+            print("Starting enhanced pickup sequence...")
+
+            # 1. Move to approach position with proper orientation
+            print("1. Moving to approach position...")
+            self.get_current_pose()
+            if not self.move_to_cartesian(approach_pos[0], approach_pos[1], approach_pos[2], rx=180, ry=0, rz=0):
+                return False
+
+
+            # 2. Move to pickup position (maintain orientation)
+            print("2. Moving to pickup position...")
+            self.get_current_pose()
+            if not self.move_to_cartesian(pickup_pos[0], pickup_pos[1], pickup_pos[2], rx=180, ry=0, rz=0, speed=10):
+                return False
+            
+            # 3. Activate vacuum
+            print("3. Activating vacuum...")
+            self.activate_vacuum()
+            sleep(1)
+
+            # 4. Lift watermelon
+            print("4. Lifting watermelon...")
+            if not self.move_to_cartesian(approach_pos[0], approach_pos[1], approach_pos[2], rx=180, ry=0, rz=0):
+                return False
+            
+            # 5. PRM Planning to bin
+            lift_joints = self.get_joint()
+            print("Current joint angles:", lift_joints)
+            current_joints = np.radians(lift_joints)
+
+            print("Moving to bin...")
+            bin_x, bin_y, bin_z = 200, 100, 100  # adjust as needed
+            bin_pos = [bin_x, bin_y, bin_z]
+            orn_bin = [180, 0, 0]  # horizontal for 
+            bin_joints = np.radians([90,-20, -120, 50, 91, 180])
+            print("Bin joints:", bin_joints)
+            #bin_joints = np.radians(self.inverse_kinematics(bin_pos, orn_bin))
+            path_bin = plan_prm(self.collision_checker, current_joints, bin_joints)
+            if path_bin:
+                path_bin_smooth = interpolate_path(path_bin)
+                print(path_bin_smooth)
+                for joint_set in path_bin:
+                        j1=np.degrees(joint_set[0])
+                        j2=np.degrees(joint_set[1])
+                        j3=np.degrees(joint_set[2])
+                        j4=np.degrees(joint_set[3])
+                        j5=np.degrees(joint_set[4])
+                        j6=np.degrees(joint_set[5])
+                        #self.move_joints(j1,j2,j3,j4,j5,j6, speed=10)
+
+            # ---- Step 11: Release ----
+            print("Releasing watermelon...")
+            self.deactivate_vacuum()
+
+            # ---- Step 12: Return to scanning mode ----
+            self.scanning_mode()
+            print("✓ Enhanced pickup completed successfully!")
+
+            return True
+
+        except Exception as e:
+            print(f"Enhanced pickup failed: {e}")
+            self.deactivate_vacuum()
+            return False
+
+    def transform_camera_to_robot(self, camera_point):
+        """Transform point from camera coordinates to robot coordinates"""
+        # TODO: Implement using your measured transformation
+        # This is where you use your camera-to-EE transformation matrix
+        # For now, returning the point as-is (assuming coordinates are already in robot frame)
+        """Transform point from camera coordinates to robot coordinates"""
+        if self.current_position is None:
+            print("No robot position available")
+            return None
+
+        try:
+            # End-Effector to camera transformation matrix
+            T_ee_to_camera = np.array([
+                [0, 1, 0, -2.4 * INCH_TO_MM],
+                [-1, 0, 0, +1.0 * INCH_TO_MM],
+                [0, 0, 1, +1.7 * INCH_TO_MM],
+                [0, 0, 0, 1]
+            ])
+
+            #End-Effector to Suction cup transformation matrix
+            T_ee_to_suction = np.array([
+                [1, 0, 0, -2.6 * INCH_TO_MM],
+                [0, 1, 0, 0],
+                [0, 0, 1, 4.9375 * INCH_TO_MM],
+                [0, 0, 0, 1]
+            ])
+
+            # Convert camera point to homogeneous coordinates
+            camera_point_h = np.array([camera_point[0], camera_point[1], camera_point[2], 1])
+
+            # Transform watermelon point (from camera) → end-effector
+            ee_point_h = T_ee_to_camera @ camera_point_h  
+            print("Watermelon to camera")
+            print(camera_point_h)
+            print("Watermelon to ee:") 
+            print(ee_point_h)
+
+            # Apply suction cup offset: ee → suction (subtract suction offset)
+            suction_point_h = T_ee_to_suction @ ee_point_h
+            #print("Suction point:") 
+            #print(suction_point_h) 
+
+            # Get current end-effector pose and convert to transformation matrix
+            current_pose = self.current_position
+            T_base_to_ee = self.pose_to_transform_matrix(current_pose)
+
+            # Transform robot base coordinates to watermelon
+            base_point_h = T_base_to_ee @ ee_point_h
+            base_point_uniform = [base_point_h[0]/base_point_h[3], base_point_h[1]/base_point_h[3], base_point_h[2]/base_point_h[3], 1]
+            print("Base to watermelon:") 
+            print(base_point_h)
+            # Get current end-effector pose and convert to transformation matrix
+            current_pose = self.current_position  # [x, y, z, rx, ry, rz] in robot base coordinates
+            x, y, z, rx, ry, rz = current_pose
+
+            # Create end-effector to base transformation matrix
+            # This is the robot's current pose in base coordinate
+
+            # Transform suction point to robot base coordinates
+            #print("After rotation")
+            #base_point_h = np.dot(T_ee_to_base, suction_point_h)
+            #print(base_point_h.shape)
+            #print(base_point_h)
+
+            #offset_point = base_point_h + np.array([-2.6 * INCH_TO_MM, 0, 4.9375 * INCH_TO_MM, 1])
+            #return offset_point[:3]
+            return base_point_h  # Return x, y, z
+
+        except Exception as e:
+            print(f"Transformation error: {e}")
+            return None
+
+    def pose_to_transform_matrix(self, pose):
+        """Convert robot pose [x, y, z, rx, ry, rz] to 4x4 transformation matrix"""
+        x, y, z, rx, ry, rz = pose
+
+        # Convert to radians
+        rx_rad = np.radians(rx)
+        ry_rad = np.radians(ry)
+        rz_rad = np.radians(rz)
+
+        # Create rotation matrices
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx_rad), -np.sin(rx_rad)],
+            [0, np.sin(rx_rad), np.cos(rx_rad)]
+        ])
+
+        Ry = np.array([
+            [np.cos(ry_rad), 0, np.sin(ry_rad)],
+            [0, 1, 0],
+            [-np.sin(ry_rad), 0, np.cos(ry_rad)]
+        ])
+
+        Rz = np.array([
+            [np.cos(rz_rad), -np.sin(rz_rad), 0],
+            [np.sin(rz_rad), np.cos(rz_rad), 0],
+            [0, 0, 1]
+        ])
+
+        # Combined rotation (ZYX convention typical for robots)
+        R = Rz @ Ry @ Rx
+
+        # 4x4 transformation matrix
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
+
+        #print("")
+        #print(R.shape)
+        #print(R)
+        #print(T.shape)
+        #print(T)
+
+        return T
+
+    def apply_suction_offset(self, watermelon_pos_base, rx, ry, rz):
+        """Apply suction cup offset with rotation compensation"""
+        # Suction cup offset from EE (in EE coordinates)
+        suction_offset_ee = np.array([
+            70,  # X offset in EE frame
+            0 * INCH_TO_MM,  # Y offset in EE frame
+            110,  # Z offset in EE frame
+            1
+        ])
+
+        # Create rotation matrix from Rx, Ry, Rz
+        rotation_matrix = self.euler_to_rotation_matrix(rx, ry, rz)
+
+        # Rotate the suction offset vector
+        suction_offset_rotated = np.dot(rotation_matrix, suction_offset_ee[:3])
+
+        # To position suction cup at watermelon, move EE to:
+        ee_target_x = watermelon_pos_base[0] - suction_offset_rotated[0]
+        ee_target_y = watermelon_pos_base[1] - suction_offset_rotated[1]
+        ee_target_z = watermelon_pos_base[2] - suction_offset_rotated[2]
+
+        return [ee_target_x, ee_target_y, ee_target_z]
+
+    def euler_to_rotation_matrix(self, rx, ry, rz):
+        """Convert Euler angles to rotation matrix"""
+        rx_rad = np.radians(rx)
+        ry_rad = np.radians(ry)
+        rz_rad = np.radians(rz)
+
+        # Create individual rotation matrices
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx_rad), -np.sin(rx_rad)],
+            [0, np.sin(rx_rad), np.cos(rx_rad)]
+        ])
+
+        Ry = np.array([
+            [np.cos(ry_rad), 0, np.sin(ry_rad)],
+            [0, 1, 0],
+            [-np.sin(ry_rad), 0, np.cos(ry_rad)]
+        ])
+
+        Rz = np.array([
+            [np.cos(rz_rad), -np.sin(rz_rad), 0],
+            [np.sin(rz_rad), np.cos(rz_rad), 0],
+            [0, 0, 1]
+        ])
+
+        # Combined rotation (ZYX convention)
+        return Rz @ Ry @ Rx
+
+    def activate_vacuum(self):
+        """Activate vacuum system"""
+        print("VACUUM ACTIVATED")
+        # TODO: Implement GPIO or Arduino control
+
+    def deactivate_vacuum(self):
+        """Deactivate vacuum system"""
+        print("VACUUM DEACTIVATED")
+        # TODO: Implement GPIO or Arduino control
+
+    def process_frame(self):
+        """Process a single frame"""
+        if self.zed.grab(self.runtime_parameters) == sl.ERROR_CODE.SUCCESS:
+            # Retrieve images and depth
+            self.zed.retrieve_image(self.image_left, sl.VIEW.LEFT)
+            self.zed.retrieve_measure(self.depth_map, sl.MEASURE.DEPTH)
+            self.zed.retrieve_measure(self.point_cloud, sl.MEASURE.XYZRGBA)
+
+            # Convert ZED image to OpenCV format - FIXED COLOR CONVERSION
+            image_ocv = self.image_left.get_data()
+            
+            # ZED returns BGRA format, convert to BGR for OpenCV
+            if image_ocv.shape[2] == 4:
+                image_ocv = cv2.cvtColor(image_ocv, cv2.COLOR_BGRA2BGR)
+
+            # Run YOLO inference
+            results = self.model(image_ocv, verbose=False)
+
+            detected_objects = []
+
+            for result in results:
+                if result.masks is not None:
+                    for mask, box in zip(result.masks.xy, result.boxes):
+                        # Get bounding box coordinates
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = box.conf[0].cpu().numpy()
+                        cls = int(box.cls[0].cpu().numpy())
+                        class_name = self.model.names[cls]
+
+                        # Calculate center point of bounding box
+                        center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
+
+                        # Get 3D position at center point
+                        point3d = self.get_3d_position(center_x, center_y)
+
+                        if point3d is not None:
+                            detected_objects.append({
+                                'class': class_name,
+                                'confidence': conf,
+                                'bbox': [x1, y1, x2, y2],
+                                'position_3d': point3d,
+                                'mask': mask
+                            })
+
+            return image_ocv, detected_objects
+        return None, []
+
+    def visualize_results(self, image, objects):
+        """Visualize detection results with 3D information"""
+        display_image = image.copy()
+
+        for obj in objects:
+            x1, y1, x2, y2 = map(int, obj['bbox'])
+            class_name = obj['class']
+            confidence = obj['confidence']
+            pos_3d = obj['position_3d']
+
+            # Draw bounding box
+            cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Draw mask
+            if obj['mask'] is not None:
+                mask_points = obj['mask'].astype(np.int32)
+                cv2.fillPoly(display_image, [mask_points], (150, 0, 0, 150))
+
+            # Display information
+            label = f"{class_name}: {confidence:.2f}"
+            info = f"X:{pos_3d[0]:.2f}mm Y:{pos_3d[1]:.2f}mm Z:{pos_3d[2]:.2f}mm"
+
+            cv2.putText(display_image, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(display_image, info, (x1, y1 - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+            # Draw center point
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            cv2.circle(display_image, (center_x, center_y), 5, (0, 0, 255), -1)
+
+        return display_image
+
+    def connect_robot(self):
+        """Connect to Dobot CR10"""
+        try:
+            print("Connecting to Dobot CR10...")
+            self.dashboard = DobotApiDashboard(self.robot_ip, 29999)
+            self.move = DobotApiMove(self.robot_ip, 30003)
+            self.feed = DobotApi(self.robot_ip, 30004)
+
+            # Enable robot
+            self.dashboard.EnableRobot(0.45, 0, 0, 0)
+
+            # Clear Error
+            self.dashboard.ClearError()
+
+            self.connected = True
+            print("Dobot CR10 connected successfully!")
+
+            # Start real-time data feed
+            self.start_feed_thread()
+
+        except Exception as e:
+            print(f"Failed to connect to Dobot: {e}")
+            self.connected = False
+
+    def get_feed_data(self):
+        """Thread function to get real-time robot data"""
+        while self.connected:
+            try:
+                data = bytes()
+                hasRead = 0
+                while hasRead < 1440:
+                    temp = self.feed.socket_dobot.recv(1440 - hasRead)
+                    if len(temp) > 0:
+                        hasRead += len(temp)
+                        data += temp
+
+                a = np.frombuffer(data, dtype=MyType)
+                if hex((a['test_value'][0])) == '0x123456789abcdef':
+                    self.current_position = a["tool_vector_actual"][0]
+                    self.joint_angles = a["q_actual"][0]
+                sleep(0.001)
+            except Exception as e:
+                print(f"Feed data error: {e}")
+                break
+
+    def start_feed_thread(self):
+        """Start the real-time data feed thread"""
+        self.feed_thread = threading.Thread(target=self.get_feed_data)
+        self.feed_thread.setDaemon(True)
+        self.feed_thread.start()
+        print("Real-time data feed started")
+
+    def get_current_pose(self):
+        """Get and print current robot position"""
+        print("Current Position of End Effector")
+        if self.current_position is not None:
+            print(f"Current Position: X={self.current_position[0]:.1f}, "
+                  f"Y={self.current_position[1]:.1f}, Z={self.current_position[2]:.1f}, "
+                  f"Rx={self.current_position[3]:.1f}, Ry={self.current_position[4]:.1f}, "
+                  f"Rz={self.current_position[5]:.1f}")
+            return self.current_position
+        else:
+            print("No position data available yet")
+            return None
+
+    def get_joint(self):
+        """Get and print current joint position"""
+        print("Current Joint Angles")
+        if self.joint_angles is not None:
+            print(f"Current Joints: J1={self.joint_angles[0]:.1f}, "
+                  f"J2={self.joint_angles[1]:.1f}, J3={self.joint_angles[2]:.1f}, "
+                  f"J4={self.joint_angles[3]:.1f}, J5={self.joint_angles[4]:.1f}, "
+                  f"J6={self.joint_angles[5]:.1f}")
+            return self.joint_angles
+        else:
+            print("No position data available yet")
+            return None
+
+    def move_to_home(self):
+        """Move to home position using joint coordinates"""
+        if not self.connected:
+            print("Robot not connected")
+            return False
+
+        try:
+            print("Moving to HOME position...")
+            # Home position in joint angles (degrees)
+            self.dashboard.SpeedFactor(30)  # Slow speed for safety
+            self.move.ServoJ(-90, 0, -153, 150, 90, 180)
+            sleep(5)  # Wait for movement to complete
+            print("Reached home position")
+            self.move.Sync()
+            self.get_current_pose(
+                
+            )
+            self.previous_com = 'h'
+            return True
+        except Exception as e:
+            print(f"Home movement failed: {e}")
+            return False
+
+
+    def move_to_bin(self):
+        """Move to bin position"""
+        # TODO: Implement your bin coordinates
+        bin_x, bin_y, bin_z = 200, 100, 100  # Example coordinates
+        return self.move_to_cartesian(bin_x, bin_y, bin_z, 180, 0, 0)
+    
+    def place_in_bin(self):
+        # Used 3D point cloud to measure depth of bin, place watermelon in deepest part of bin
+        image, objects = self.process_frame()
+        depth_map = self.depth_map.get_data()
+        point_cloud = self.point_cloud.get_data()
+        if image is not None:
+            bin_object = objects[0]  # Get first detected bin
+            bbox = bin_object['bbox']
+            x1, y1, x2, y2 = [10,10,10,10]    #size of bin
+            # Extract depth values within bounding box
+            depth_values = depth_map[y1:y2, x1:x2]
+            point_cloud_values = point_cloud[y1:y2, x1:x2]
+
+            # Find the pixel with maximum depth (deepest point)
+            min_depth = np.min(depth_values[np.nonzero(depth_values)])  # Ignore zero depth
+            indices = np.where(depth_values == min_depth)
+            if len(indices[0]) > 0:
+                deepest_y = indices[0][0] + y1
+                deepest_x = indices[1][0] + x1
+
+                # Get corresponding 3D point
+                err, point3d = self.point_cloud.get_value(deepest_x, deepest_y)
+                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(point3d[:3]).all():
+                    print(f"Deepest point in bin at pixel ({deepest_x}, {deepest_y}) with depth {min_depth}mm")
+                    # Transform to robot coordinates and move
+                    robot_pos = self.transform_camera_to_robot(point3d[:3])
+                    if robot_pos is not None:
+                        self.move_to_cartesian(robot_pos[0], robot_pos[1], robot_pos[2] + 50, 180, 0, 0)  # Approach above
+                        self.move_to_cartesian(robot_pos[0], robot_pos[1], robot_pos[2], 180, 0, 0)  # Move down
+                        self.deactivate_vacuum()  # Release watermelon
+                        self.move_to_cartesian(robot_pos[0], robot_pos[1], robot_pos[2] + 50, 180, 0, 0)  # Move up
+                        print("Watermelon placed in bin successfully")
+                        return
+
+        return
+
+    def move_to_cartesian(self, x, y, z, rx=0, ry=0, rz=0, speed=10):
+        """Move to Cartesian position (ServoP)"""
+        if not self.connected:
+            print("Robot not connected")
+            return False
+
+        try:
+            print(f"Moving to Cartesian position: X={x}, Y={y}, Z={z}")
+            self.dashboard.SpeedFactor(speed)
+            self.move.ServoP(x, y, z, rx, ry, rz)
+            sleep(5)  # Wait for movement
+            print("Movement completed")
+            self.move.Sync()
+            self.get_current_pose()
+
+            return True
+        except Exception as e:
+            print(f"Cartesian movement failed: {e}")
+            return False
+
+    def move_joints(self, j1, j2, j3, j4, j5, j6, speed=15):
+        """Move to joint angles (ServoJ)"""
+        if not self.connected:
+            print("Robot not connected")
+            return False
+
+        try:
+            print(f"Moving joints: J1={j1}, J2={j2}, J3={j3}, J4={j4}, J5={j5}, J6={j6}")
+            self.dashboard.SpeedFactor(speed)
+            self.move.ServoJ(j1, j2, j3, j4, j5, j6)
+            sleep(3)
+            print("Joint movement completed")
+            self.move.Sync()
+            self.get_joint()
+            self.previous_com = 'j'
+            return True
+        except Exception as e:
+            print(f"Joint movement failed: {e}")
+            return False
+
+    def scanning_mode(self):
+        print("Moving to scanning mode")
+        self.move_joints(-90.053, -35.428, -32.35, -22.406, 91.616, 179.03)
+        sleep(1)
+        if self.current_position is not None:
+            x, y, z, rx, ry, rz = self.current_position
+            rx = 180
+            ry = 0
+            rz = 0
+            """changed rx ry rz make end effector parallel to ground"""
+            self.move_to_cartesian(x, y, z, rx, ry, rz)
+            print(self.get_joint())
+            sleep(1)
+            print("Scanning Mode Position Complete")
+
+    def auto_scan_helper(self):
+        """Auto scan thread function"""
+        reverse = 1
+        while not self.stop_auto_scan.is_set():
+            if self.joint_angles is not None:
+                j1, j2, j3, j4, j5, j6 = self.joint_angles
+                if (round(j1) <= -150):
+                    reverse = 1
+                elif (round(j1) >= -30):
+                    reverse = -1
+                j1 = j1 + reverse * SCANNING_TRAVEL
+                self.move_joints(j1, j2, j3, j4, j5, j6)
+            sleep(0.1)
+
+            image, objects = self.process_frame()
+            if objects:
+                detected_watermelon = objects[0]  # Get first detected watermelon
+            for watermelon in objects:
+                if watermelon['confidence'] >= CONF_VALUE:
+                    print("Watermelon detected")
+                    self.stop_auto_scan.set()  # Stop scanning
+                    self.j1_harvest = self.get_joint()[0]
+                    success = detector.enhanced_pickup_watermelon(watermelon)
+                    sleep(0.5)
+                    j1,j2,j3,j4,j5,j6 = self.get_joint()
+                    self.move_joints(self.j1_harvest,j2,j3, j4, j5, j6)
+                    self.stop_auto_scan.clear()  # Resume scanning
+                break
+
+    def start_auto_scan(self):
+        """Start auto scan in a separate thread"""
+        if self.auto_scan_active:
+            print("Auto scan is already running!")
+            return
+            
+        print("Starting auto scan...")
+        self.move_joints(-90.053, -35.428, -32.35, -22.406, 91.616, 179.03)
+        self.scanning_mode()
+        self.stop_auto_scan.clear()
+        self.auto_scan_active = True
+        
+        self.auto_scan_thread = threading.Thread(target=self.auto_scan_helper)
+        self.auto_scan_thread.daemon = True
+        self.auto_scan_thread.start()
+        print("Auto scan started. Press 'a' to stop.")
+
+    def stop_auto_scan_func(self):
+        """Stop auto scan"""
+        if not self.auto_scan_active:
+            print("Auto scan is not running!")
+            return
+            
+        print("Stopping auto scan...")
+        self.stop_auto_scan.set()
+        if self.auto_scan_thread:
+            self.auto_scan_thread.join(timeout=2.0)
+        self.auto_scan_active = False
+        print("Auto scan stopped.")
+
+    def video_display_loop(self):
+        """Video display thread function"""
+        cv2.namedWindow("ZED + YOLO 3D Detection", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("ZED + YOLO 3D Detection", 1280, 720)
+        
+        while not self.stop_video.is_set():
+            image, objects = self.process_frame()
+
+            if image is not None:
+                # Visualize results
+                display_image = self.visualize_results(image, objects)
+                
+                # Add status information to display
+                status = "Auto Scan: " + ("ACTIVE" if self.auto_scan_active else "INACTIVE")
+                cv2.putText(display_image, status, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(display_image, "Press 'a' to toggle auto-scan", (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_image, "Press 't' for travel mode", (10, 110), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_image, "Press 'q' to quit, 'c' to clear error", (10, 150), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                cv2.imshow("ZED + YOLO 3D Detection", display_image)
+
+            # Check for key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.stop_video.set()
+                break
+            elif key == ord('a'):
+                if self.auto_scan_active:
+                    self.stop_auto_scan_func()
+                else:
+                    self.start_auto_scan()
+                sleep(0.2)  # Debounce
+            elif key == ord('t') and not self.auto_scan_active:
+                print("Moving to travel mode...")
+                self.travel_mode()
+            elif key == ord('c'):
+                print("Clearing error")
+                self.dashboard.ClearError()
+
+    def move_base(self):
+        print("Moving to rotation mode")
+        con = ''
+        j1, j2, j3, j4, j5, j6 = self.joint_angles
+        while True:
+            self.get_joint()
+            try:
+                j1 = math.fmod(float(input("Enter J1 rotation ")), 360)
+                self.move_joints(j1, j2, j3, j4, j5, j6)
+            except ValueError:
+                print("Invalid input! Please enter numbers only.")
+            con = input("Continue Enter 'c'")
+            if con != 'c':
+                break
+
+    def travel_mode(self):
+        print("Moving to travel mode")
+        self.move_joints(-90, 0, 0, 0, 45, 180)
+        self.move_joints(-90, 0, -75, 90, 90, 180)
+        self.move_joints(-90, 0, -156, 90, 90, 180)
+        self.move_joints(-90, 0, -156, 162, 90, 180)
+        self.move_joints(-90, 0, -156, 162, 90, 180)
+
+    def get_3d_position(self, x, y):
+        """Convert 2D pixel coordinates to 3D world coordinates"""
+        err, point3d = self.point_cloud.get_value(x, y)
+        if np.isfinite(point3d[0]) and np.isfinite(point3d[1]) and np.isfinite(point3d[2]):
+            return point3d
+        return None
+
+    def run(self):
+        """Main loop"""
+
+        
+
+        if not self.connected:
+            print("Failed to connect to robot. Exiting.")
+            return
+
+        try:
+            # Move to home first
+            self.move_to_home()
+            sleep(2)
+            
+            # Start video display thread
+            self.video_thread = threading.Thread(target=self.video_display_loop)
+            self.video_thread.daemon = True
+            self.video_thread.start()
+            #self.pose_to_transform_matrix(self.current_position)
+            #self.get_current_pose
+            print("System started!")
+            print("Controls:")
+            print("  'a' - Toggle auto-scan")
+            print("  't' - Travel mode (when auto-scan is off)")
+            print("  'q' - Quit program")
+            
+            # Wait for video thread to finish (when 'q' is pressed)
+            self.video_thread.join()
+            
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Clean up connections"""
+        print("Cleaning up and disconnecting...")
+        
+        # Stop all threads
+        self.stop_auto_scan.set()
+        self.stop_video.set()
+        self.connected = False
+        
+        # Wait for threads to finish
+        if self.auto_scan_thread and self.auto_scan_thread.is_alive():
+            self.auto_scan_thread.join(timeout=2.0)
+        
+        sleep(0.5)
+
+        try:
+            # Disable the robot first (safety)
+            if self.dashboard:
+                self.dashboard.DisableRobot()
+            if self.feed:
+                self.feed.socket_dobot.close()
+            if self.move:
+                self.move.socket_dobot.close()
+            if self.dashboard:
+                self.dashboard.socket_dobot.close()
+            print("Robot disabled")
+        except Exception as e:
+            print(f"Error disabling robot: {e}")
+        
+        # Close ZED camera
+        if self.zed:
+            self.zed.close()
+        
+        # Close OpenCV windows
+        cv2.destroyAllWindows()
+        
+        # Clear the objects
+        self.dashboard = None
+        self.move = None
+        self.feed = None
+        self.feed_thread = None
+
+        print("All connections properly closed")
+
+   
+# Usage
+if __name__ == "__main__":
+
+    p.connect(p.DIRECT)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation()
+    p.setGravity(0, 0, -9.81)
+    
+    urdf_path_1 = "/cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10_boxes.urdf"
+    urdf_path_2 = "/cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10.urdf"
+    urdf_path_3 = "cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10.urdf"
+        # ---- Load table ----
+    table_id = p.loadURDF(
+        "table/table.urdf",
+        basePosition=[0, 0, 0],
+        useFixedBase=True,
+        globalScaling=2.0
+    )
+
+    # ---- Load robot on table ----
+    robot_base_height = 1.26
+    robot_id_collision = p.loadURDF(
+        urdf_path_1,
+        basePosition=[0, 0, robot_base_height],
+        useFixedBase=True,
+        flags=p.URDF_USE_SELF_COLLISION
+    )
+    robot_id = p.loadURDF(
+        urdf_path_2,
+        basePosition=[0, 0, robot_base_height],
+        useFixedBase=True
+    )
+    chain = Chain.from_urdf_file(urdf_path_3, active_links_mask=[False, True, True, True, True, True, True, False])
+
+    # ---- Joints ----
+    joint_indices = [0,1,2,3,4,5]
+    joint_limits = [(-360,360), (-360,360), (-160,160), (-360,360), (-360,360), (-360,360)]
+    joint_radians = [(np.radians(lo), np.radians(hi)) for (lo, hi) in joint_limits]
+    
+    collision_checker = BulletCollisionChecker(
+            robot_id, robot_id_collision, joint_indices, joint_radians, obstacle_ids=[table_id]
+        )
+    detector = ZEDYOLO3D(robot_id, collision_checker, chain)
+    detector.run()
+
+    
+
+

@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+import random
+import time
+import pybullet as p
+import pybullet_data
+import numpy as np
+from ompl import base as ob
+from ompl import geometric as og
+
+# ===============================
+# Bullet Collision Checker
+# ===============================
+class BulletCollisionChecker:
+    def __init__(self, robot_id, joint_indices, joint_limits, obstacle_ids=None):
+        self.robot_id = robot_id
+        #self.robot_id_collision = robot_id_collision
+        self.joint_indices = joint_indices
+        self.joint_limits = joint_limits 
+        self.ndof = len(joint_indices)
+        self.obstacle_ids = obstacle_ids if obstacle_ids else []
+
+        # Build set of adjacent links (parent-child pairs)
+        self.adjacent_links = set()
+        for i in range(p.getNumJoints(self.robot_id)):
+            info = p.getJointInfo(self.robot_id, i)
+            parent = info[16]  # parent link index
+            child = i          # child link index
+            if parent >= 0:
+                self.adjacent_links.add((parent, child))
+                self.adjacent_links.add((child, parent))  # undirected
+
+    def set_state(self, q):
+        for j, v in zip(self.joint_indices, q):
+            p.resetJointState(self.robot_id, j, v)
+            #p.resetJointState(self.robot_id_collision, j, v)
+
+    def in_collision(self, q):
+        self.set_state(q)
+        p.performCollisionDetection()
+
+        # Self-collision: only allow contacts between adjacent links
+        contacts = p.getContactPoints(self.robot_id, self.robot_id)
+        for c in contacts:
+            link_a = c[3]
+            link_b = c[4]
+            if abs(link_a - link_b) <= 1:
+                continue  # allowed
+            return True  # collision detected
+
+        # Collision with obstacles (table)
+        for obs_id in self.obstacle_ids:
+            if len(p.getContactPoints(self.robot_id, obs_id)) > 0:
+                return True
+
+        return False
+    
+# ===============================
+# PRM Planner
+# ===============================
+
+def plan_prm(collision_checker, start_q, joints, planning_time=1.0):
+    dim = collision_checker.ndof
+    print("dim:", dim)
+    space = ob.RealVectorStateSpace(dim)
+    bounds = ob.RealVectorBounds(dim)
+    for i, (lo, hi) in enumerate(collision_checker.joint_limits):
+        bounds.setLow(i, lo)
+        bounds.setHigh(i, hi)
+    space.setBounds(bounds)
+    si = ob.SpaceInformation(space)
+    def is_valid(state):
+        q = [state[i] for i in range(dim)]
+        if collision_checker.in_collision(q):
+            return False
+        return True
+
+    si.setStateValidityChecker(ob.StateValidityCheckerFn(is_valid))
+    si.setup()
+    goal_q = joints
+    valid = 0
+    for _ in range(100):
+        q = [np.random.uniform(lo,hi) for (lo,hi) in collision_checker.joint_limits]
+        if not collision_checker.in_collision(q):
+            valid += 1
+    print(f"Found {valid} valid random configurations out of 100")
+
+    start = ob.State(space)
+    goal = ob.State(space)
+    for i in range(dim):
+        start[i] = start_q[i]
+        goal[i] = goal_q[i]
+
+    objective = ob.PathLengthOptimizationObjective(si)
+
+
+    pdef = ob.ProblemDefinition(si)
+    pdef.setStartAndGoalStates(start, goal)
+    pdef.setOptimizationObjective(objective)
+
+    planner = og.PRMstar(si)
+    planner.setProblemDefinition(pdef)
+    planner.setup()
+
+    solved = planner.solve(planning_time)
+    if not solved:
+        print("No solution found")
+        return None
+    
+    if solved:
+        print("Found solution:")
+
+        path = pdef.getSolutionPath()
+        print("path:" , path)
+        joint_path = []
+        for i in range(path.getStateCount()):
+            joint_path.append([path.getState(i)[j] for j in range(dim)])
+        print("Joint path:", joint_path)
+
+    return joint_path
+
+# ===============================
+# Interpolate path for smooth animation
+# ===============================
+def interpolate_path(path, max_steps_per_edge=20):
+    smooth = []
+    for i in range(len(path) - 1):
+        q0 = np.array(path[i])
+        q1 = np.array(path[i + 1])
+        steps = max(1, min(max_steps_per_edge, int(np.linalg.norm(q1 - q0)/0.1)))
+        for s in range(steps):
+            alpha = s / steps
+            smooth.append((1 - alpha) * q0 + alpha * q1)
+    smooth.append(path[-1])
+    return smooth
+
+# ===============================
+# Animate robot along joint-space path
+# ===============================
+def animate_path_fk(robot_id, joint_indices, path, dt=0.05):
+    for q in path:
+        for j, v in zip(joint_indices, q):
+            p.resetJointState(robot_id, j, v)
+        p.stepSimulation()
+        time.sleep(dt)
+
+# ===============================
+# Main
+# ===============================
+def main():
+    urdf_path = "/cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10_boxes.urdf"
+    urdf_path_2 = "/cr10_ws/src/dobot_cr10_description/urdf/dobot_cr10.urdf"
+    bin_urdf = "/cr10_ws/src/bin_description/Assem1.urdf"
+
+    # ---- GUI ----
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation()
+    p.setGravity(0, 0, -9.81)
+
+    # ---- Load table ----
+    #table_id = p.loadURDF(
+     #   "table/table.urdf",
+      #  basePosition=[0, 0, 0],
+       # useFixedBase=True
+    #)
+
+    cart = p.createCollisionShape(p.GEOM_BOX, halfExtents=[.8, 0.75, 0.3])
+    cart_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[.8, 0.75, 0.3])
+
+    bin = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.3937, 0.357251, 0.17145])
+    bin_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3937, 0.357251, 0.17145], rgbaColor=[1,0,0,1])
+
+    # ---- Load robot on table ----
+    robot_base_height = 0.63
+    #robot_id_collision = p.loadURDF(
+        #urdf_path,
+        #basePosition=[0, -0.4, 0.41],
+        #useFixedBase=True,
+        #flags=p.URDF_USE_SELF_COLLISION
+    #)
+
+    robot_id = p.loadURDF(
+        urdf_path_2,
+        basePosition=[0, -0.6, 0.33],
+        useFixedBase=True
+    )
+
+    carts =p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=cart,
+        baseVisualShapeIndex=cart_visual,
+        basePosition=[0, 0, 0]
+    )
+
+    #bin_id = p.loadURDF(
+        #bin_urdf,
+        #basePosition=[0, 0.25, 0.3],
+        #useFixedBase=True
+    #)
+
+    bins = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=bin,
+        baseVisualShapeIndex=bin_visual,
+        basePosition=[0, 0.25, 0.3]
+    )
+
+    # ---- Joints ----
+    joint_indices = [0,1,2,3,4,5]
+    joint_limits = [(-360,360), (-360,360), (-160,160), (-360,360), (-360,360), (-360,360)]
+    joint_radians = [(np.radians(lo), np.radians(hi)) for (lo, hi) in joint_limits]
+
+
+    collision_checker = BulletCollisionChecker(
+        robot_id, joint_indices, joint_radians, obstacle_ids=[carts, bins]
+    )
+
+    # ---- Initial configuration ----
+    start_q = np.radians([-180.053, -35.428, -32.35, -22.406, -91.616, 179.03])
+    end_q = np.radians([45, -.428, -100.35, -22.406, -91.616, 179.03])
+    attempts = 0
+    
+
+    # ---- Loop ----
+    while True:
+        if attempts % 2 ==0:
+            current_q = start_q
+            goal_q = end_q
+        else:
+            current_q = end_q
+            goal_q = start_q
+            
+        
+        joint_path = plan_prm(collision_checker, current_q, goal_q)
+        if joint_path is None:
+            print("No path found, replanning...")
+            time.sleep(.5)
+            continue
+
+        smooth_path = interpolate_path(joint_path, max_steps_per_edge=5)
+        animate_path_fk(robot_id, joint_indices, smooth_path, dt=0.1)
+        attempts = attempts + 1
+
+        time.sleep(1.0)
+
+if __name__ == "__main__":
+    main()
